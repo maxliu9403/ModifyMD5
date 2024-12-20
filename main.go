@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"log"
 	"math/rand"
 	"os"
@@ -53,7 +56,35 @@ func modifyFileContent(filePath string, r *rand.Rand) ([]byte, error) {
 	return data, nil
 }
 
-// 创建一个新的文件夹来保存修改后的文件
+// cropImage 用于裁剪图像，裁剪掉四个边各 10 个像素
+func cropImage(imgData []byte, cropWidth, cropHeight int) (image.Image, error) {
+	// 解码图像
+	img, err := jpeg.Decode(bytes.NewReader(imgData))
+	if err != nil {
+		return nil, fmt.Errorf("解码JPEG图像时出错: %v", err)
+	}
+
+	// 获取图像的宽度和高度
+	imgWidth := img.Bounds().Max.X
+	imgHeight := img.Bounds().Max.Y
+
+	// 计算裁剪区域
+	cropRect := image.Rect(cropWidth, cropHeight, imgWidth-cropWidth, imgHeight-cropWidth)
+
+	// 确保裁剪区域不会超出原图范围
+	if cropRect.Dx() <= 0 || cropRect.Dy() <= 0 {
+		return nil, fmt.Errorf("裁剪区域无效，可能导致宽度或高度为负值")
+	}
+
+	// 裁剪并返回裁剪后的图像
+	croppedImg := img.(interface {
+		SubImage(r image.Rectangle) image.Image
+	}).SubImage(cropRect)
+
+	return croppedImg, nil
+}
+
+// createNewFolderAndSaveFile 创建文件夹并保存裁剪后的图像
 func createNewFolderAndSaveFile(srcPath, destPath string, modifiedData []byte) (string, error) {
 	// 创建目标文件夹
 	err := os.MkdirAll(destPath, os.ModePerm)
@@ -61,14 +92,31 @@ func createNewFolderAndSaveFile(srcPath, destPath string, modifiedData []byte) (
 		return "", err
 	}
 
-	// 获取文件名并保存到新目录
-	newFilePath := filepath.Join(destPath, filepath.Base(srcPath))
-	err = os.WriteFile(newFilePath, modifiedData, 0644) // 使用 os.WriteFile 代替 ioutil.WriteFile
+	cropWidth := rand.Intn(20) + 1  // 生成 1 到 20 之间的随机数
+	cropHeight := rand.Intn(20) + 1 // 生成 1 到 20 之间的随机数
+
+	// 调用裁剪函数
+	croppedImg, err := cropImage(modifiedData, cropWidth, cropHeight)
 	if err != nil {
 		return "", err
 	}
 
-	return newFilePath, nil // 返回新的文件路径
+	// 生成目标文件路径
+	newFilePath := filepath.Join(destPath, filepath.Base(srcPath))
+
+	// 保存裁剪后的图像为PNG或JPEG
+	dstFile, err := os.Create(newFilePath)
+	if err != nil {
+		return "", err
+	}
+
+	// 使用JPEG格式并设置质量
+	err = jpeg.Encode(dstFile, croppedImg, &jpeg.Options{Quality: 80})
+	if err != nil {
+		return "", err
+	}
+
+	return newFilePath, nil
 }
 
 // 删除文件夹及其内容（如果已存在）
@@ -100,7 +148,6 @@ func deleteFolderIfExist(modifiedFolder string) error {
 
 // 随机设置修改次数
 func modifyFilesInFolder(folderPath string, modifyTimes int, r *rand.Rand) error {
-
 	// 为每个子文件夹创建一个新的子文件夹来保存修改后的图片
 	modifiedFolder := filepath.Join(folderPath, "modified")
 	err := deleteFolderIfExist(modifiedFolder)
