@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"image/png"
 	"log"
 	"math/rand"
 	"os"
@@ -59,9 +60,9 @@ func modifyFileContent(filePath string, r *rand.Rand) ([]byte, error) {
 // cropImage 用于裁剪图像，裁剪掉四个边各 10 个像素
 func cropImage(imgData []byte, cropWidth, cropHeight int) (image.Image, error) {
 	// 解码图像
-	img, err := jpeg.Decode(bytes.NewReader(imgData))
+	img, _, err := image.Decode(bytes.NewReader(imgData))
 	if err != nil {
-		return nil, fmt.Errorf("解码JPEG图像时出错: %v", err)
+		return nil, fmt.Errorf("解码图像时出错: %v", err)
 	}
 
 	// 获取图像的宽度和高度
@@ -82,6 +83,28 @@ func cropImage(imgData []byte, cropWidth, cropHeight int) (image.Image, error) {
 	}).SubImage(cropRect)
 
 	return croppedImg, nil
+}
+
+// saveImage 根据文件类型保存裁剪后的图像
+func saveImage(img image.Image, dstFile *os.File, format string) error {
+	switch strings.ToLower(format) {
+	case "jpeg", "jpg":
+		// 使用JPEG格式保存图像，设置质量为80
+		err := jpeg.Encode(dstFile, img, &jpeg.Options{Quality: 80})
+		if err != nil {
+			return fmt.Errorf("保存JPEG图像时出错: %v", err)
+		}
+	case "png":
+		// 使用PNG格式保存图像，设置最高压缩级别
+		encoder := png.Encoder{CompressionLevel: png.BestCompression} // 设置最高压缩级别
+		err := encoder.Encode(dstFile, img)
+		if err != nil {
+			return fmt.Errorf("保存PNG图像时出错: %v", err)
+		}
+	default:
+		return fmt.Errorf("不支持的图像格式: %s", format)
+	}
+	return nil
 }
 
 // createNewFolderAndSaveFile 创建文件夹并保存裁剪后的图像
@@ -110,8 +133,12 @@ func createNewFolderAndSaveFile(srcPath, destPath string, modifiedData []byte) (
 		return "", err
 	}
 
-	// 使用JPEG格式并设置质量
-	err = jpeg.Encode(dstFile, croppedImg, &jpeg.Options{Quality: 80})
+	// 获取文件扩展名
+	ext := filepath.Ext(newFilePath)
+	ext = ext[1:] // 去掉扩展名的点
+
+	// 根据文件类型保存图像
+	err = saveImage(croppedImg, dstFile, ext)
 	if err != nil {
 		return "", err
 	}
