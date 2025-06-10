@@ -10,6 +10,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -58,19 +59,112 @@ func cropImage(imgData []byte, cropWidth, cropHeight int) (image.Image, error) {
 	return croppedImg, nil
 }
 
-func saveImage(img image.Image, dstFile *os.File, format string) error {
-	switch strings.ToLower(format) {
-	case "jpeg", "jpg":
-		return jpeg.Encode(dstFile, img, &jpeg.Options{Quality: 80})
-	case "png":
-		encoder := png.Encoder{CompressionLevel: png.BestCompression}
-		return encoder.Encode(dstFile, img)
+// 定义压缩错误类型
+var (
+	ErrUnsupportedFormat  = fmt.Errorf("不支持的图像格式")
+	ErrTargetSizeTooSmall = fmt.Errorf("目标大小过小，无法压缩")
+)
+
+// 增强版 saveImage，支持指定目标大小（单位KB）
+func saveImage(img image.Image, dstFile *os.File, format string, targetKB int) error {
+	format = strings.ToLower(format)
+
+	// 不指定大小时使用默认压缩
+	if targetKB <= 0 {
+		return saveDefault(img, dstFile, format)
+	}
+
+	targetBytes := int64(targetKB) * 1024 // 转换为字节
+
+	switch format {
+	case "jpeg", "jpg", "png":
+		return compressJPEG(img, dstFile, targetBytes)
 	default:
-		return fmt.Errorf("不支持的图像格式: %s", format)
+		return fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
 	}
 }
 
-func createNewFolderAndSaveFile(srcPath, destPath string, modifiedData []byte) (string, error) {
+// 默认保存方式（无目标大小）
+func saveDefault(img image.Image, dstFile *os.File, format string) error {
+	switch format {
+	case "jpeg", "jpg", "png":
+		return jpeg.Encode(dstFile, img, &jpeg.Options{Quality: 80})
+	//case "png":
+	//	encoder := png.Encoder{CompressionLevel: png.BestCompression}
+	//	return encoder.Encode(dstFile, img)
+	default:
+		return fmt.Errorf("%w: %s", ErrUnsupportedFormat, format)
+	}
+}
+
+// JPEG压缩（带大小控制）
+func compressJPEG(img image.Image, dstFile *os.File, targetBytes int64) error {
+	// 边界检查
+	minBuf := bytes.NewBuffer(nil)
+	if err := jpeg.Encode(minBuf, img, &jpeg.Options{Quality: 1}); err != nil {
+		return err
+	}
+	if int64(minBuf.Len()) > targetBytes {
+		return fmt.Errorf("%w: 最低质量图像仍大于目标大小", ErrTargetSizeTooSmall)
+	}
+
+	// 二分法查找最佳质量参数
+	low, high := 1, 100
+	var bestBuf *bytes.Buffer
+
+	for low <= high {
+		mid := (low + high) / 2
+		buf := bytes.NewBuffer(nil)
+
+		if err := jpeg.Encode(buf, img, &jpeg.Options{Quality: mid}); err != nil {
+			return err
+		}
+
+		size := int64(buf.Len())
+
+		if size <= targetBytes {
+
+			bestBuf = buf
+			low = mid + 1 // 尝试更高质量
+		} else {
+			high = mid - 1 // 质量过高，需要降低
+		}
+	}
+
+	// 写入最佳结果
+	if bestBuf != nil {
+		_, err := io.Copy(dstFile, bestBuf)
+		return err
+	}
+
+	// 保底：使用最低质量
+	_, err := io.Copy(dstFile, minBuf)
+	return err
+}
+
+// PNG压缩（带大小控制）
+func compressPNG(img image.Image, dstFile *os.File, targetBytes int64) error {
+	// 尝试最高压缩级别
+	buf := bytes.NewBuffer(nil)
+	encoder := png.Encoder{CompressionLevel: png.BestCompression}
+	if err := encoder.Encode(buf, img); err != nil {
+		return err
+	}
+
+	// 检查是否满足大小要求
+	if int64(buf.Len()) <= targetBytes {
+		_, err := io.Copy(dstFile, buf)
+		return err
+	}
+
+	// PNG无法进一步压缩，返回错误但仍保存
+	_, _ = io.Copy(dstFile, buf)
+	return fmt.Errorf("PNG压缩后仍超出目标大小 (%.2fKB > %.2fKB)",
+		float64(buf.Len())/1024,
+		float64(targetBytes)/1024)
+}
+
+func createNewFolderAndSaveFile(srcPath, destPath string, modifiedData []byte, targetKB int) (string, error) {
 	err := os.MkdirAll(destPath, os.ModePerm)
 	if err != nil {
 		return "", err
@@ -88,7 +182,7 @@ func createNewFolderAndSaveFile(srcPath, destPath string, modifiedData []byte) (
 	}
 	defer dstFile.Close()
 	ext := strings.TrimPrefix(filepath.Ext(newFilePath), ".")
-	err = saveImage(croppedImg, dstFile, ext)
+	err = saveImage(croppedImg, dstFile, ext, targetKB)
 	return newFilePath, err
 }
 
@@ -107,7 +201,7 @@ func deleteFolderIfExist(modifiedFolder string) error {
 	return nil
 }
 
-func runProcess(parentFolder string, modifyTimes int, r *rand.Rand) {
+func runProcess(parentFolder string, modifyTimes, targetKB int, r *rand.Rand) {
 	dirImages := make(map[string][]string)
 
 	// 第一步：遍历并按文件夹分组
@@ -171,7 +265,7 @@ func runProcess(parentFolder string, modifyTimes int, r *rand.Rand) {
 				}
 			}
 
-			newFilePath, err := createNewFolderAndSaveFile(path, modifiedDir, modifiedData)
+			newFilePath, err := createNewFolderAndSaveFile(path, modifiedDir, modifiedData, targetKB)
 			if err != nil {
 				log.Printf("保存新文件失败: %v", err)
 				continue
@@ -200,28 +294,36 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
+		var targetKB, modifyTimes int
 		var parentFolder string
-		var modifyTimes int
 		flagSet := flag.NewFlagSet("image-modifier", flag.ContinueOnError)
 		autoOnce := flagSet.Bool("once", false, "只执行一次后退出（非交互）")
 		pathPtr := flagSet.String("path", "", "处理路径（可选）")
 		timesPtr := flagSet.Int("times", 0, "每个文件最大修改次数（可选）")
-		flagSet.Parse(os.Args[1:])
+		targetKBPtr := flagSet.Int("targetKB", 300, "压缩图片文件的大小，单位KB，默认300KB（可选）")
+		err := flagSet.Parse(os.Args[1:])
+		if err != nil {
+			return
+		}
 
-		if *pathPtr != "" && *timesPtr > 0 {
+		if *pathPtr != "" && *timesPtr > 0 && *targetKBPtr > 0 {
 			parentFolder = *pathPtr
 			modifyTimes = *timesPtr
-			fmt.Printf("使用命令行参数: 路径 = %s，最大修改次数 = %d\n", parentFolder, modifyTimes)
+			targetKB = *targetKBPtr
+			fmt.Printf("使用命令行参数: 路径 = %s，最大修改次数 = %d，压缩图片大小 = %d\n", parentFolder, modifyTimes, targetKBPtr)
 		} else {
 			fmt.Print("请输入处理路径: ")
 			scanner.Scan()
 			parentFolder = scanner.Text()
-			fmt.Print("请输入每个文件最大修改次数: ")
+			fmt.Print("请输入每个文件最大修改次数：")
 			scanner.Scan()
 			fmt.Sscanf(scanner.Text(), "%d", &modifyTimes)
+			fmt.Print("请输入压缩图片的大小需0KB，默认压缩到80%: ")
+			scanner.Scan()
+			fmt.Sscanf(scanner.Text(), "%d", &targetKB)
 		}
 
-		runProcess(parentFolder, modifyTimes, r)
+		runProcess(parentFolder, modifyTimes, targetKB, r)
 
 		if *autoOnce {
 			break
